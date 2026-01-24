@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 import datetime
@@ -16,18 +17,36 @@ PAIR_SUFFIX = '/USDT'
 TIMEFRAME = '1m'
 START_DATE = "2018-01-01 00:00:00"
 CSV_SUFFIX = "1m.csv"
+DATA_DIR = "/app/data"
+
+# Ensure data directory exists
+if not os.path.exists(DATA_DIR):
+    try:
+        os.makedirs(DATA_DIR)
+        print(f"Created directory: {DATA_DIR}")
+    except OSError as e:
+        print(f"Error creating directory {DATA_DIR}: {e}")
+        sys.stdout.flush()
 
 # Flask App
 app = Flask(__name__)
 
-# --- Data Management ---
+# --- Helper Functions ---
+
+def log(msg):
+    """Prints message and forces stdout flush."""
+    print(msg)
+    sys.stdout.flush()
 
 def get_filename(symbol):
-    """Returns the filename for a given symbol (e.g., BTC -> BTC1m.csv)."""
+    """Returns the absolute filepath for a given symbol (e.g., /app/data/BTC1m.csv)."""
     clean_symbol = symbol.replace('/', '')
     # User requested format: xxx1m.csv (using the coin ticker)
     ticker = clean_symbol.replace('USDT', '') 
-    return f"{ticker}{CSV_SUFFIX}"
+    filename = f"{ticker}{CSV_SUFFIX}"
+    return os.path.join(DATA_DIR, filename)
+
+# --- Data Management ---
 
 def load_existing_data(filepath):
     """Loads existing CSV if present, otherwise returns empty DataFrame."""
@@ -38,7 +57,7 @@ def load_existing_data(filepath):
             df['timestamp'] = df['timestamp'].astype(int)
             return df
         except Exception as e:
-            print(f"Error reading {filepath}: {e}")
+            log(f"Error reading {filepath}: {e}")
     
     return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
@@ -58,15 +77,15 @@ def fetch_worker():
     # parse start date to timestamp ms
     start_ts = int(datetime.datetime.strptime(START_DATE, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
 
-    print("--- Fetcher Thread Started ---")
+    log("--- Fetcher Thread Started ---")
 
     while True:
         for coin in COINS:
             symbol = f"{coin}{PAIR_SUFFIX}"
-            filename = get_filename(coin)
+            filepath = get_filename(coin)
             
             # 1. Load current state
-            df = load_existing_data(filename)
+            df = load_existing_data(filepath)
             
             # 2. Determine 'since' parameter
             if not df.empty:
@@ -93,20 +112,20 @@ def fetch_worker():
                     df = df.drop_duplicates(subset=['timestamp'], keep='last')
                     df = df.sort_values(by='timestamp')
                     
-                    save_data(df, filename)
+                    save_data(df, filepath)
                     
                     # Convert last timestamp to readable for logging
                     last_time_readable = datetime.datetime.fromtimestamp(ohlcv[-1][0]/1000).strftime('%Y-%m-%d %H:%M')
-                    print(f"[{coin}] Updated. Last candle: {last_time_readable}. Rows: {len(df)}")
+                    log(f"[{coin}] Updated. Last candle: {last_time_readable}. Rows: {len(df)}")
                 
                 else:
                     # No data returned, possibly requesting future data or symbol issue
                     pass
 
             except ccxt.BadSymbol:
-                print(f"[{coin}] Symbol {symbol} not found on exchange.")
+                log(f"[{coin}] Symbol {symbol} not found on exchange.")
             except Exception as e:
-                print(f"[{coin}] Fetch error: {e}")
+                log(f"[{coin}] Fetch error: {e}")
             
             # Rate limit sleep is handled partly by CCXT, but adding a small buffer helps CPU usage
             time.sleep(1) 
@@ -126,16 +145,16 @@ def download_file(coin):
     if coin not in COINS:
         abort(404, description="Coin not tracked.")
     
-    filename = get_filename(coin)
+    filepath = get_filename(coin)
     
-    if os.path.exists(filename):
-        return send_file(filename, as_attachment=True)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True)
     else:
         abort(404, description="File not found (fetching might be in progress).")
 
 def server_worker():
     """Background thread to run Flask server."""
-    print("--- Server Thread Started on port 5000 ---")
+    log("--- Server Thread Started on port 5000 ---")
     # debug=False is critical for threading context
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
@@ -156,4 +175,4 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("Stopping...")
+        log("Stopping...")
