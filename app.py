@@ -3,6 +3,7 @@ import sys
 import time
 import threading
 import datetime
+import fcntl  # specific to Unix/Linux (Railway/Docker)
 import pandas as pd
 import ccxt
 from flask import Flask, send_file, abort
@@ -18,155 +19,132 @@ TIMEFRAME = '1m'
 START_DATE = "2018-01-01 00:00:00"
 CSV_SUFFIX = "1m.csv"
 DATA_DIR = "/app/data"
+LOCK_FILE = "/tmp/fetcher.lock"  # Lock file to ensure singleton thread
 
 # Ensure data directory exists
-if not os.path.exists(DATA_DIR):
-    try:
-        os.makedirs(DATA_DIR)
-        print(f"Created directory: {DATA_DIR}")
-        sys.stdout.flush()
-    except OSError as e:
-        print(f"Error creating directory {DATA_DIR}: {e}")
-        sys.stdout.flush()
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Flask App
-app = Flask(__name__)
-
-# --- Helper Functions ---
-
-def log(msg):
-    """Prints message and forces stdout flush."""
-    # Add timestamp to logs for clarity in Railway
+# --- Logging ---
+def log(msg, level="INFO"):
+    """
+    Production friendly logging. 
+    Flushing stdout is required for container logs to appear immediately.
+    """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}] [{level}] {msg}")
     sys.stdout.flush()
-
-def get_filename(symbol):
-    """Returns the absolute filepath for a given symbol."""
-    clean_symbol = symbol.replace('/', '')
-    ticker = clean_symbol.replace('USDT', '') 
-    filename = f"{ticker}{CSV_SUFFIX}"
-    return os.path.join(DATA_DIR, filename)
 
 # --- Data Management ---
 
-def load_existing_data(filepath):
-    """Loads existing CSV if present, otherwise returns empty DataFrame."""
+def get_filepath(symbol):
+    """Returns absolute path for CSV."""
+    clean_symbol = symbol.replace('/', '').replace('USDT', '')
+    return os.path.join(DATA_DIR, f"{clean_symbol}{CSV_SUFFIX}")
+
+def load_data(filepath):
     if os.path.exists(filepath):
         try:
             df = pd.read_csv(filepath)
             df['timestamp'] = df['timestamp'].astype(int)
             return df
         except Exception as e:
-            log(f"Error reading {filepath}: {e}")
-    
+            log(f"Corrupt file found {filepath}: {e}", level="ERROR")
     return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
 def save_data(df, filepath):
-    """Saves DataFrame to CSV."""
-    df.to_csv(filepath, index=False)
+    # Atomic write pattern: write to temp then rename to prevent read-conflicts
+    tmp_path = filepath + ".tmp"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, filepath)
 
 # --- Fetcher Logic ---
 
-def fetch_worker():
-    """Background thread to fetch OHLC data."""
-    # Slight delay to ensure app is fully loaded before logic starts
-    time.sleep(2)
-    
-    exchange = ccxt.binance({
-        'enableRateLimit': True, 
-        'options': {'defaultType': 'spot'}
-    })
-    
+def fetch_loop():
+    """Main loop for fetching data."""
+    exchange = ccxt.binance({'enableRateLimit': True})
     start_ts = int(datetime.datetime.strptime(START_DATE, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
-
-    log("--- Fetcher Thread Started (Background) ---")
+    
+    log("Fetcher thread active and running.")
 
     while True:
         for coin in COINS:
             symbol = f"{coin}{PAIR_SUFFIX}"
-            filepath = get_filename(coin)
+            filepath = get_filepath(coin)
             
-            # 1. Load current state
-            df = load_existing_data(filepath)
+            df = load_data(filepath)
             
-            # 2. Determine 'since' parameter
             if not df.empty:
-                last_ts = df['timestamp'].iloc[-1]
-                since = last_ts + 60000 
+                since = df['timestamp'].iloc[-1] + 60000
             else:
                 since = start_ts
 
-            # Check if we are already up to date (allow 2 mins buffer)
-            now_ts = exchange.milliseconds()
-            if since > (now_ts - 120000):
+            # Optimization: Don't hit API if we are up to date (2 min buffer)
+            if since > (exchange.milliseconds() - 120000):
                 continue
 
-            # 3. Fetch Data
             try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, since=since, limit=1000)
-                
+                ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since, 1000)
                 if ohlcv:
-                    new_data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    
-                    df = pd.concat([df, new_data])
-                    df = df.drop_duplicates(subset=['timestamp'], keep='last')
-                    df = df.sort_values(by='timestamp')
-                    
+                    new_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df = pd.concat([df, new_df]).drop_duplicates('timestamp', keep='last').sort_values('timestamp')
                     save_data(df, filepath)
                     
-                    last_time_readable = datetime.datetime.fromtimestamp(ohlcv[-1][0]/1000).strftime('%Y-%m-%d %H:%M')
-                    log(f"[{coin}] Updated. Last candle: {last_time_readable}. Rows: {len(df)}")
-                
-            except ccxt.BadSymbol:
-                log(f"[{coin}] Symbol {symbol} not found.")
+                    last_date = datetime.datetime.fromtimestamp(ohlcv[-1][0]/1000)
+                    log(f"[{coin}] Sync: {last_date}")
             except Exception as e:
-                log(f"[{coin}] Fetch error: {e}")
-            
-            time.sleep(1) 
+                log(f"[{coin}] Error: {e}", level="WARN")
+                time.sleep(5) # Backoff on error
+
+            time.sleep(0.5) # Rate limit protection
         
-        time.sleep(1)
+        time.sleep(2) # Global loop delay
 
-# --- Server Logic ---
+# --- Singleton Thread Manager ---
 
-@app.route('/download/<coin>', methods=['GET'])
-def download_file(coin):
+def start_background_thread():
+    """
+    Uses a non-blocking file lock to ensure ONLY ONE worker process 
+    starts the background thread.
+    """
+    try:
+        # Create/Open a lock file
+        f = open(LOCK_FILE, 'w')
+        # Try to acquire an exclusive lock (LOCK_EX) with non-blocking (LOCK_NB)
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # If we got here, we own the lock. Start the thread.
+        log("Lock acquired. Starting Background Fetcher.")
+        t = threading.Thread(target=fetch_loop, daemon=True)
+        t.start()
+        
+        # We purposely do not close 'f' here. We hold it open for the life of the process.
+        # If this worker dies, the OS releases the file lock automatically.
+        return True
+    except IOError:
+        # Another process holds the lock.
+        log("Lock active in another worker. Fetcher thread skipped.")
+        return False
+
+# --- Flask Application ---
+
+app = Flask(__name__)
+
+# Trigger thread startup when this module is loaded by Gunicorn
+# This will run in every worker, but only ONE will succeed in acquiring the lock.
+start_background_thread()
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+@app.route('/download/<coin>')
+def download(coin):
     coin = coin.upper()
     if coin not in COINS:
-        abort(404, description="Coin not tracked.")
+        abort(404, description="Invalid Coin")
     
-    filepath = get_filename(coin)
-    
+    filepath = get_filepath(coin)
     if os.path.exists(filepath):
         return send_file(filepath, as_attachment=True)
-    else:
-        abort(404, description="File not found.")
-
-def server_worker():
-    """Legacy: Only used if running locally via python main.py"""
-    log("--- Server Thread Started on port 5000 ---")
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
-# --- GLOBAL EXECUTION (Run on Import) ---
-
-# We define a startup function to ensure the thread starts 
-# regardless of whether Gunicorn or Python runs the file.
-def start_background_tasks():
-    # Only start if not already running (basic check)
-    # Note: In Gunicorn, every worker will run this. 
-    # Ensure you set Railway "Start Command" to use 1 worker if possible, 
-    # or rely on the OS locking files (risky).
-    # For now, we assume 1 worker or we accept the race condition for simplicity.
-    t_fetch = threading.Thread(target=fetch_worker, daemon=True)
-    t_fetch.start()
-    log("Background task initialized.")
-
-# Trigger startup immediately upon import
-start_background_tasks()
-
-# --- Main Execution (Local Only) ---
-
-if __name__ == "__main__":
-    # If run locally, we also need to start the server manually.
-    # In production (Gunicorn), this block is SKIPPED.
-    server_worker()
+    
+    abort(404, description="Data not yet available")
