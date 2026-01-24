@@ -24,6 +24,7 @@ if not os.path.exists(DATA_DIR):
     try:
         os.makedirs(DATA_DIR)
         print(f"Created directory: {DATA_DIR}")
+        sys.stdout.flush()
     except OSError as e:
         print(f"Error creating directory {DATA_DIR}: {e}")
         sys.stdout.flush()
@@ -35,13 +36,14 @@ app = Flask(__name__)
 
 def log(msg):
     """Prints message and forces stdout flush."""
-    print(msg)
+    # Add timestamp to logs for clarity in Railway
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
     sys.stdout.flush()
 
 def get_filename(symbol):
-    """Returns the absolute filepath for a given symbol (e.g., /app/data/BTC1m.csv)."""
+    """Returns the absolute filepath for a given symbol."""
     clean_symbol = symbol.replace('/', '')
-    # User requested format: xxx1m.csv (using the coin ticker)
     ticker = clean_symbol.replace('USDT', '') 
     filename = f"{ticker}{CSV_SUFFIX}"
     return os.path.join(DATA_DIR, filename)
@@ -53,7 +55,6 @@ def load_existing_data(filepath):
     if os.path.exists(filepath):
         try:
             df = pd.read_csv(filepath)
-            # Ensure timestamp is correct type for comparison
             df['timestamp'] = df['timestamp'].astype(int)
             return df
         except Exception as e:
@@ -69,15 +70,17 @@ def save_data(df, filepath):
 
 def fetch_worker():
     """Background thread to fetch OHLC data."""
+    # Slight delay to ensure app is fully loaded before logic starts
+    time.sleep(2)
+    
     exchange = ccxt.binance({
         'enableRateLimit': True, 
         'options': {'defaultType': 'spot'}
     })
     
-    # parse start date to timestamp ms
     start_ts = int(datetime.datetime.strptime(START_DATE, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
 
-    log("--- Fetcher Thread Started ---")
+    log("--- Fetcher Thread Started (Background) ---")
 
     while True:
         for coin in COINS:
@@ -90,7 +93,7 @@ def fetch_worker():
             # 2. Determine 'since' parameter
             if not df.empty:
                 last_ts = df['timestamp'].iloc[-1]
-                since = last_ts + 60000 # Start 1 minute after last record
+                since = last_ts + 60000 
             else:
                 since = start_ts
 
@@ -99,48 +102,35 @@ def fetch_worker():
             if since > (now_ts - 120000):
                 continue
 
-            # 3. Fetch Data (Chunked)
+            # 3. Fetch Data
             try:
-                # Binance limit is usually 1000 candles per call
                 ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, since=since, limit=1000)
                 
                 if ohlcv:
                     new_data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
-                    # Concat and Deduplicate
                     df = pd.concat([df, new_data])
                     df = df.drop_duplicates(subset=['timestamp'], keep='last')
                     df = df.sort_values(by='timestamp')
                     
                     save_data(df, filepath)
                     
-                    # Convert last timestamp to readable for logging
                     last_time_readable = datetime.datetime.fromtimestamp(ohlcv[-1][0]/1000).strftime('%Y-%m-%d %H:%M')
                     log(f"[{coin}] Updated. Last candle: {last_time_readable}. Rows: {len(df)}")
                 
-                else:
-                    # No data returned, possibly requesting future data or symbol issue
-                    pass
-
             except ccxt.BadSymbol:
-                log(f"[{coin}] Symbol {symbol} not found on exchange.")
+                log(f"[{coin}] Symbol {symbol} not found.")
             except Exception as e:
                 log(f"[{coin}] Fetch error: {e}")
             
-            # Rate limit sleep is handled partly by CCXT, but adding a small buffer helps CPU usage
             time.sleep(1) 
         
-        # Determine global sleep. 
-        # If we are catching up history, we loop fast. 
-        # If we are live, we can sleep longer, but we check continually.
         time.sleep(1)
 
 # --- Server Logic ---
 
 @app.route('/download/<coin>', methods=['GET'])
 def download_file(coin):
-    """Endpoint to download the specific CSV file."""
-    # Sanitize input
     coin = coin.upper()
     if coin not in COINS:
         abort(404, description="Coin not tracked.")
@@ -150,29 +140,33 @@ def download_file(coin):
     if os.path.exists(filepath):
         return send_file(filepath, as_attachment=True)
     else:
-        abort(404, description="File not found (fetching might be in progress).")
+        abort(404, description="File not found.")
 
 def server_worker():
-    """Background thread to run Flask server."""
+    """Legacy: Only used if running locally via python main.py"""
     log("--- Server Thread Started on port 5000 ---")
-    # debug=False is critical for threading context
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
-# --- Main Execution ---
+# --- GLOBAL EXECUTION (Run on Import) ---
 
-if __name__ == "__main__":
-    # 1. Start Fetcher Thread
+# We define a startup function to ensure the thread starts 
+# regardless of whether Gunicorn or Python runs the file.
+def start_background_tasks():
+    # Only start if not already running (basic check)
+    # Note: In Gunicorn, every worker will run this. 
+    # Ensure you set Railway "Start Command" to use 1 worker if possible, 
+    # or rely on the OS locking files (risky).
+    # For now, we assume 1 worker or we accept the race condition for simplicity.
     t_fetch = threading.Thread(target=fetch_worker, daemon=True)
     t_fetch.start()
+    log("Background task initialized.")
 
-    # 2. Start Server Thread (Blocking call, keeps main alive or reverse)
-    # Since app.run blocks, we run it in a thread or main. 
-    # Here we run it in a thread to allow potential main-thread management if extended later.
-    t_server = threading.Thread(target=server_worker, daemon=True)
-    t_server.start()
+# Trigger startup immediately upon import
+start_background_tasks()
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        log("Stopping...")
+# --- Main Execution (Local Only) ---
+
+if __name__ == "__main__":
+    # If run locally, we also need to start the server manually.
+    # In production (Gunicorn), this block is SKIPPED.
+    server_worker()
