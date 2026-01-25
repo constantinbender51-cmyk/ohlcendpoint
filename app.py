@@ -31,10 +31,15 @@ def ensure_directory():
 def fetch_ohlcv(symbol):
     """
     Fetches 1m OHLCV data from Binance from 2018 to 2026.
-    Handles pagination and rate limits.
+    If the file already exists, the download is skipped.
     """
     filename = f"{symbol}1m.csv"
     filepath = os.path.join(DATA_DIR, filename)
+
+    # Check if file already exists
+    if os.path.exists(filepath):
+        print(f"Data for {symbol} already exists at {filepath}. Skipping download.")
+        return
     
     print(f"Starting fetch for {symbol} (1m) from {START_DATE} to {END_DATE}...")
 
