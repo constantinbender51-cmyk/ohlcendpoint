@@ -13,6 +13,7 @@ DATA_DIR = "/app/data"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 START_DATE = "2018-01-01"
 END_DATE = "2026-01-01"
+SERVER_PORT = 8000
 
 def get_asset_symbol():
     """Retrieves the asset symbol from the environment variable."""
@@ -95,29 +96,56 @@ def fetch_ohlcv(symbol):
 
     print(f"\nData fetch complete. Saved to {filepath}")
 
-class SingleFileHandler(BaseHTTPRequestHandler):
+class CSVRequestHandler(BaseHTTPRequestHandler):
     """
-    Custom HTTP Handler that serves only the specific CSV file
-    assigned to its server instance.
+    Custom HTTP Handler that serves a file list on root and downloads CSVs on specific paths.
     """
-    def __init__(self, target_file, *args, **kwargs):
-        self.target_file = target_file
-        super().__init__(*args, **kwargs)
-
     def do_GET(self):
         try:
-            # We serve the file regardless of the path requested to ensure strictly one file per server
-            if os.path.exists(self.target_file):
-                with open(self.target_file, 'rb') as f:
+            # Route 1: Root / displays the list of files
+            if self.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                
+                files = [f for f in os.listdir(DATA_DIR) if f.endswith(".csv")]
+                
+                html = "<html><head><title>Data Files</title></head><body>"
+                html += "<h1>Available CSV Files</h1><ul>"
+                
+                if files:
+                    for f in files:
+                        html += f'<li><a href="/{f}">{f}</a></li>'
+                else:
+                    html += "<li>No files found.</li>"
+                    
+                html += "</ul></body></html>"
+                self.wfile.write(html.encode('utf-8'))
+                return
+
+            # Route 2: /filename.csv downloads the file
+            # Strip leading slash to get filename
+            requested_file = self.path.lstrip('/')
+            
+            # Basic security: ensure no directory traversal and strict csv extension
+            if '..' in requested_file or not requested_file.endswith('.csv'):
+                 self.send_error(403, "Forbidden")
+                 return
+
+            filepath = os.path.join(DATA_DIR, requested_file)
+
+            if os.path.exists(filepath):
+                with open(filepath, 'rb') as f:
                     content = f.read()
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'text/csv')
-                self.send_header('Content-Disposition', f'attachment; filename="{os.path.basename(self.target_file)}"')
+                self.send_header('Content-Disposition', f'attachment; filename="{requested_file}"')
                 self.end_headers()
                 self.wfile.write(content)
             else:
                 self.send_error(404, "File not found")
+                
         except Exception as e:
             self.send_error(500, f"Internal Server Error: {str(e)}")
 
@@ -125,45 +153,16 @@ class SingleFileHandler(BaseHTTPRequestHandler):
         # Suppress default logging to keep console clean
         pass
 
-def start_server_thread(filepath, port):
-    """Starts a HTTPServer for a specific file in a new thread."""
-    def handler_factory(*args, **kwargs):
-        return SingleFileHandler(filepath, *args, **kwargs)
-
-    server = HTTPServer(('0.0.0.0', port), handler_factory)
-    print(f"Serving {os.path.basename(filepath)} on port {port} (Thread: {threading.current_thread().name})")
-    server.serve_forever()
-
 def serve_csvs():
-    """Scans the data directory and spawns a thread/server for every CSV found."""
-    files = [f for f in os.listdir(DATA_DIR) if f.endswith(".csv")]
-    
-    if not files:
-        print("No CSV files found to serve.")
-        return
-
-    base_port = 8000
-    threads = []
-
-    print("\n--- Starting Servers ---")
-    for i, filename in enumerate(files):
-        filepath = os.path.join(DATA_DIR, filename)
-        port = base_port + i
-        
-        # Create a thread for this specific file server
-        t = threading.Thread(target=start_server_thread, args=(filepath, port), name=f"Server-{filename}")
-        t.daemon = True # Daemon threads exit when main program exits
-        t.start()
-        threads.append(t)
-
-    print(f"Active servers: {len(threads)}. Press Ctrl+C to stop.")
-    
-    # Keep the main thread alive to allow daemon threads to run
+    """Starts a single HTTPServer to serve the data directory."""
+    server = HTTPServer(('0.0.0.0', SERVER_PORT), CSVRequestHandler)
+    print(f"\nServer running on port {SERVER_PORT}")
+    print(f"Access list at: http://localhost:{SERVER_PORT}/")
     try:
-        while True:
-            time.sleep(1)
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping servers...")
+        print("\nStopping server...")
+        server.server_close()
 
 def main():
     ensure_directory()
