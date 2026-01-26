@@ -4,9 +4,10 @@ import threading
 import pandas as pd
 import ccxt
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
-# --- 1. Force Unbuffered Logging (Fixes missing logs) ---
+# --- 1. Force Unbuffered Logging ---
 sys.stdout.reconfigure(line_buffering=True)
 
 # --- Configuration ---
@@ -26,6 +27,7 @@ exchange = ccxt.binance({'enableRateLimit': True})
 # --- Helper Functions ---
 
 def get_filename(symbol: str) -> str:
+    # Converts BTC/USDT -> BTC_USDT.csv
     return os.path.join(DATA_DIR, f"{symbol.replace('/', '_')}.csv")
 
 def save_data(symbol: str, data: list):
@@ -37,27 +39,25 @@ def save_data(symbol: str, data: list):
     
     filename = get_filename(symbol)
     df.to_csv(filename, index=False)
-    print(f"[{symbol}] SAVED {len(df)} rows to disk.")
+    print(f"[{symbol}] SAVED {len(df)} rows to {filename}")
 
 def fetch_worker():
-    """Background thread that runs once on startup."""
-    print("--- STARTUP: BACKGROUND DOWNLOADER STARTED ---")
+    """Background thread that downloads data."""
+    print("--- BACKGROUND DOWNLOADER STARTED ---")
     
     start_ts = exchange.parse8601(SINCE_STR)
     end_ts = exchange.parse8601(END_STR)
-    timeframe_duration_ms = 60 * 1000
+    duration = 60 * 1000
 
     for symbol in SYMBOLS:
         filename = get_filename(symbol)
         
-        # 3. Load if found (Skip download if file exists to save time on restarts)
-        if os.path.exists(filename):
+        # Skip if file exists and has content
+        if os.path.exists(filename) and os.path.getsize(filename) > 0:
             print(f"[{symbol}] Found local file. Skipping download.")
             continue
 
-        print(f"[{symbol}] Downloading data (2020-2026)...")
-        
-        # Fetch Logic
+        print(f"[{symbol}] Downloading...")
         all_ohlcv = []
         current_since = start_ts
         
@@ -65,20 +65,18 @@ def fetch_worker():
             try:
                 ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=current_since, limit=1000)
                 if not ohlcv:
-                    current_since += (1000 * timeframe_duration_ms)
+                    current_since += (1000 * duration)
                     if current_since >= end_ts: break
                     continue
 
-                # Filter > 2026
                 ohlcv = [x for x in ohlcv if x[0] < end_ts]
                 if not ohlcv: break
 
                 all_ohlcv.extend(ohlcv)
-                current_since = ohlcv[-1][0] + timeframe_duration_ms
+                current_since = ohlcv[-1][0] + duration
                 
-                # Optional: Partial save or log every 50k rows could go here
-                if len(all_ohlcv) % 10000 == 0:
-                    print(f"[{symbol}] ... fetched {len(all_ohlcv)} candles so far")
+                if len(all_ohlcv) % 50000 == 0:
+                    print(f"[{symbol}] ... fetched {len(all_ohlcv)} rows")
 
             except Exception as e:
                 print(f"[{symbol}] Error: {e}")
@@ -92,50 +90,23 @@ def fetch_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start the downloader in a separate thread so it doesn't block the API
+    # Start downloader on boot
     thread = threading.Thread(target=fetch_worker, daemon=True)
     thread.start()
     yield
-    # (Optional) Cleanup logic here if needed
 
 app = FastAPI(lifespan=lifespan)
 
-# --- Endpoints ---
+# --- ONE LINE TO SERVE EVERYTHING ---
+# This makes http://localhost:8000/data/BTC_USDT.csv work automatically
+app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 
 @app.get("/")
 def index():
-    return {"status": "running", "local_data": os.listdir(DATA_DIR)}
-
-@app.get("/data/{symbol_ticker}")
-def get_ohlc(symbol_ticker: str, limit: int = 100):
-    target = f"{symbol_ticker.upper()}/USDT"
-    filename = get_filename(target)
-    
-    if not os.path.exists(filename):
-        # If file is currently downloading, it might not exist yet
-        raise HTTPException(404, detail="Data downloading or not found")
-        
-    df = pd.read_csv(filename)
-    return {
-        "symbol": target,
-        "total_records": len(df),
-        "data": df.tail(limit).to_dict(orient="records")
-    }
-
-@app.get("/download/{symbol_ticker}")
-def download_full_csv(symbol_ticker: str):
-    target = f"{symbol_ticker.upper()}/USDT"
-    file_path = get_filename(target) # e.g., /app/data/BTC_USDT.csv
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(
-        path=file_path, 
-        filename=os.path.basename(file_path), # <--- Forces download name to be "BTC_USDT.csv"
-        media_type='text/csv'
-    )
-
+    # Helper to show links to available files
+    files = os.listdir(DATA_DIR)
+    links = {f: f"/data/{f}" for f in files if f.endswith(".csv")}
+    return {"status": "running", "available_files": links}
 
 if __name__ == "__main__":
     import uvicorn
