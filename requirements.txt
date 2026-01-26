@@ -1,4 +1,6 @@
-Flask
+fastapi
+uvicorn
 pandas
 ccxt
 gunicorn
+python-dotenv
