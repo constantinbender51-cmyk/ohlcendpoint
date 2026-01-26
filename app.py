@@ -122,6 +122,21 @@ def get_ohlc(symbol_ticker: str, limit: int = 100):
         "data": df.tail(limit).to_dict(orient="records")
     }
 
+@app.get("/download/{symbol_ticker}")
+def download_full_csv(symbol_ticker: str):
+    target = f"{symbol_ticker.upper()}/USDT"
+    file_path = get_filename(target) # e.g., /app/data/BTC_USDT.csv
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path, 
+        filename=os.path.basename(file_path), # <--- Forces download name to be "BTC_USDT.csv"
+        media_type='text/csv'
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
