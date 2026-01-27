@@ -27,8 +27,11 @@ exchange = ccxt.binance({'enableRateLimit': True})
 # --- Helper Functions ---
 
 def get_filename(symbol: str) -> str:
-    # Converts BTC/USDT -> BTC_USDT.csv
-    return os.path.join(DATA_DIR, f"{symbol.replace('/', '_')}.csv")
+    """
+    Converts 'BTC/USDT' -> 'btc1m.csv'
+    """
+    base = symbol.split('/')[0].lower() # Takes 'BTC' from 'BTC/USDT' and lowercases it
+    return os.path.join(DATA_DIR, f"{base}1m.csv")
 
 def save_data(symbol: str, data: list):
     if not data: return
@@ -52,12 +55,12 @@ def fetch_worker():
     for symbol in SYMBOLS:
         filename = get_filename(symbol)
         
-        # Skip if file exists and has content
+        # Check if file exists to prevent re-downloading
         if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            print(f"[{symbol}] Found local file. Skipping download.")
+            print(f"[{symbol}] Found {os.path.basename(filename)}. Skipping download.")
             continue
 
-        print(f"[{symbol}] Downloading...")
+        print(f"[{symbol}] Downloading to {os.path.basename(filename)}...")
         all_ohlcv = []
         current_since = start_ts
         
@@ -90,20 +93,18 @@ def fetch_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start downloader on boot
     thread = threading.Thread(target=fetch_worker, daemon=True)
     thread.start()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# --- ONE LINE TO SERVE EVERYTHING ---
-# This makes http://localhost:8000/data/BTC_USDT.csv work automatically
+# --- SERVE FILES ---
+# Access via: http://localhost:8000/data/btc1m.csv
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 
 @app.get("/")
 def index():
-    # Helper to show links to available files
     files = os.listdir(DATA_DIR)
     links = {f: f"/data/{f}" for f in files if f.endswith(".csv")}
     return {"status": "running", "available_files": links}
