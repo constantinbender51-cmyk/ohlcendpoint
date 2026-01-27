@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 import threading
 import pandas as pd
 import ccxt
@@ -21,73 +22,154 @@ SYMBOLS = [
     "AVAX/USDT", "LTC/USDT", "HBAR/USDT", "SHIB/USDT", "TON/USDT",
 ]
 
+# Map "BTC/USDT" -> "btc1m.csv"
+SYMBOL_TO_FILE = {
+    s: f"{s.split('/')[0].lower()}1m.csv" for s in SYMBOLS
+}
+
 os.makedirs(DATA_DIR, exist_ok=True)
 exchange = ccxt.binance({'enableRateLimit': True})
 
 # --- Helper Functions ---
 
-def get_filename(symbol: str) -> str:
-    """
-    Converts 'BTC/USDT' -> 'btc1m.csv'
-    """
-    base = symbol.split('/')[0].lower() # Takes 'BTC' from 'BTC/USDT' and lowercases it
-    return os.path.join(DATA_DIR, f"{base}1m.csv")
+def get_file_path(filename: str) -> str:
+    return os.path.join(DATA_DIR, filename)
 
-def save_data(symbol: str, data: list):
+def get_last_timestamp(file_path: str) -> int:
+    """
+    Reads the last line of the CSV to get the last timestamp efficiently.
+    Returns None if file is empty or invalid.
+    """
+    try:
+        if os.path.getsize(file_path) < 100:
+            return None # Too small to contain data
+            
+        with open(file_path, 'rb') as f:
+            # Jump to near the end of the file
+            try:
+                f.seek(-1024, 2)
+            except OSError:
+                f.seek(0)
+            
+            lines = f.readlines()
+            if not lines:
+                return None
+                
+            # Get last line
+            last_line = lines[-1].decode().strip()
+            # Split by comma, first item is timestamp
+            return int(last_line.split(',')[0])
+    except Exception as e:
+        print(f"Error reading last timestamp of {file_path}: {e}")
+        return None
+
+def append_data(file_path: str, data: list):
     if not data: return
     df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.sort_values('timestamp', inplace=True)
-    df.drop_duplicates(subset='timestamp', keep='last', inplace=True)
     
-    filename = get_filename(symbol)
-    df.to_csv(filename, index=False)
-    print(f"[{symbol}] SAVED {len(df)} rows to {filename}")
+    # Append without header
+    df.to_csv(file_path, mode='a', header=False, index=False)
+    print(f"[{os.path.basename(file_path)}] Appended {len(df)} rows.")
+
+def create_new_file(file_path: str, data: list):
+    if not data: return
+    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    df.to_csv(file_path, mode='w', header=True, index=False)
+    print(f"[{os.path.basename(file_path)}] Created new file with {len(df)} rows.")
+
+def cleanup_directory():
+    """Deletes files that are not in our target list."""
+    print("--- CLEANUP STARTED ---")
+    allowed_files = set(SYMBOL_TO_FILE.values())
+    
+    for filename in os.listdir(DATA_DIR):
+        if filename not in allowed_files:
+            full_path = os.path.join(DATA_DIR, filename)
+            if os.path.isfile(full_path):
+                os.remove(full_path)
+                print(f"Deleted extraneous file: {filename}")
+    print("--- CLEANUP FINISHED ---")
 
 def fetch_worker():
-    """Background thread that downloads data."""
-    print("--- BACKGROUND DOWNLOADER STARTED ---")
+    """Smart Background Downloader."""
+    cleanup_directory()
+    print("--- SMART SYNC STARTED ---")
     
-    start_ts = exchange.parse8601(SINCE_STR)
-    end_ts = exchange.parse8601(END_STR)
-    duration = 60 * 1000
+    target_start_ms = exchange.parse8601(SINCE_STR)
+    target_end_ms = exchange.parse8601(END_STR)
+    duration_ms = 60 * 1000
 
     for symbol in SYMBOLS:
-        filename = get_filename(symbol)
+        filename = SYMBOL_TO_FILE[symbol]
+        file_path = get_file_path(filename)
         
-        # Check if file exists to prevent re-downloading
-        if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            print(f"[{symbol}] Found {os.path.basename(filename)}. Skipping download.")
-            continue
-
-        print(f"[{symbol}] Downloading to {os.path.basename(filename)}...")
-        all_ohlcv = []
-        current_since = start_ts
+        start_fetch_from = target_start_ms
+        mode = 'write' # 'write' or 'append'
         
-        while current_since < end_ts:
+        # 1. Check existing file status
+        if os.path.exists(file_path):
+            last_ts = get_last_timestamp(file_path)
+            
+            if last_ts:
+                readable_last = exchange.iso8601(last_ts)
+                
+                if last_ts >= (target_end_ms - duration_ms):
+                    print(f"[{symbol}] Complete ({readable_last}). Skipping.")
+                    continue
+                else:
+                    print(f"[{symbol}] Incomplete. Ends at {readable_last}. Resuming...")
+                    start_fetch_from = last_ts + duration_ms
+                    mode = 'append'
+            else:
+                print(f"[{symbol}] File invalid/empty. Re-downloading from scratch.")
+        
+        # 2. Fetch Loop
+        current_since = start_fetch_from
+        batch_data = []
+        
+        print(f"[{symbol}] Fetching {exchange.iso8601(current_since)} -> {END_STR}...")
+        
+        while current_since < target_end_ms:
             try:
                 ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=current_since, limit=1000)
+                
                 if not ohlcv:
-                    current_since += (1000 * duration)
-                    if current_since >= end_ts: break
+                    # No data found (gap or coin didn't exist yet)
+                    current_since += (1000 * duration_ms)
+                    if current_since >= target_end_ms: break
                     continue
 
-                ohlcv = [x for x in ohlcv if x[0] < end_ts]
+                # Filter logic: Stop at 2026 strict
+                ohlcv = [x for x in ohlcv if x[0] < target_end_ms]
                 if not ohlcv: break
 
-                all_ohlcv.extend(ohlcv)
-                current_since = ohlcv[-1][0] + duration
+                batch_data.extend(ohlcv)
+                current_since = ohlcv[-1][0] + duration_ms
                 
-                if len(all_ohlcv) % 50000 == 0:
-                    print(f"[{symbol}] ... fetched {len(all_ohlcv)} rows")
+                # Save/Append in chunks of 50k to avoid memory spikes
+                if len(batch_data) >= 50000:
+                    if mode == 'write':
+                        create_new_file(file_path, batch_data)
+                        mode = 'append' # Switch to append for subsequent chunks
+                    else:
+                        append_data(file_path, batch_data)
+                    batch_data = [] # Clear memory
 
             except Exception as e:
                 print(f"[{symbol}] Error: {e}")
                 import time; time.sleep(5)
 
-        save_data(symbol, all_ohlcv)
-    
-    print("--- BACKGROUND DOWNLOADER FINISHED ---")
+        # Flush remaining data
+        if batch_data:
+            if mode == 'write':
+                create_new_file(file_path, batch_data)
+            else:
+                append_data(file_path, batch_data)
+        
+    print("--- SMART SYNC FINISHED ---")
 
 # --- FastAPI Lifecycle ---
 
@@ -99,15 +181,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# --- SERVE FILES ---
-# Access via: http://localhost:8000/data/btc1m.csv
+# Serve files directly at /data/btc1m.csv
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 
 @app.get("/")
 def index():
-    files = os.listdir(DATA_DIR)
-    links = {f: f"/data/{f}" for f in files if f.endswith(".csv")}
-    return {"status": "running", "available_files": links}
+    files = os.listdir(DATA_DIR) if os.path.exists(DATA_DIR) else []
+    links = {f: f"/data/{f}" for f in files}
+    return {"status": "running", "files": links}
 
 if __name__ == "__main__":
     import uvicorn
