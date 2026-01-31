@@ -3,6 +3,7 @@ import sys
 import threading
 import pandas as pd
 import ccxt
+import gc
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -73,6 +74,8 @@ def append_to_csv(file_path: str, data: list):
     df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.to_csv(file_path, mode='a', header=False, index=False)
+    del df
+    gc.collect()
 
 def create_new_csv(file_path: str, data: list):
     """Creates new CSV."""
@@ -81,6 +84,8 @@ def create_new_csv(file_path: str, data: list):
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.to_csv(file_path, mode='w', header=True, index=False)
     print(f"[{os.path.basename(file_path)}] Created new file with {len(df)} rows.")
+    del df
+    gc.collect()
 
 def fetch_worker():
     print("--- STRICT SYNC STARTED ---")
@@ -139,6 +144,7 @@ def fetch_worker():
                     
                     print(f"[{filename}] ... reached {exchange.iso8601(current_since)}")
                     batch_data = [] # Clear memory
+                    gc.collect()
 
             except Exception as e:
                 print(f"[{filename}] Error: {e}. Retrying...")
@@ -151,6 +157,9 @@ def fetch_worker():
             else:
                 append_to_csv(file_path, batch_data)
             print(f"[{filename}] DOWNLOAD COMPLETE.")
+            
+        del batch_data
+        gc.collect()
         
     print("--- ALL FILES SYNCED ---")
 
