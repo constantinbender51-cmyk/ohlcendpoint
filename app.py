@@ -4,9 +4,11 @@ import threading
 import pandas as pd
 import ccxt
 import gc
+import io
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse, FileResponse
 
 # --- 1. Force Real-Time Logging ---
 sys.stdout.reconfigure(line_buffering=True)
@@ -163,6 +165,58 @@ def fetch_worker():
         
     print("--- ALL FILES SYNCED ---")
 
+def resample_buffer(file_path: str, timeframe: str) -> io.StringIO:
+    """Reads CSV, resamples, returns string buffer."""
+    # Mapping
+    tf_map = {
+        '1m': '1min', '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
+        '1h': '1h', '2h': '2h', '4h': '4h', '6h': '6h', '8h': '8h', '12h': '12h',
+        '1d': '1D', '3d': '3D', '1w': '1W', '1M': '1ME'
+    }
+    
+    rule = tf_map.get(timeframe)
+    if not rule:
+        # Generic fallback
+        if timeframe.endswith('m'): rule = timeframe.replace('m', 'min')
+        elif timeframe.endswith('h'): rule = timeframe.upper()
+        elif timeframe.endswith('d'): rule = timeframe.upper()
+        else: raise ValueError(f"Invalid timeframe: {timeframe}")
+
+    # Load
+    df = pd.read_csv(file_path)
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('datetime', inplace=True)
+    
+    # Resample
+    agg_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+    
+    resampled = df.resample(rule).agg(agg_dict)
+    resampled.dropna(inplace=True)
+    
+    # Reconstruct timestamp from index (start of bin)
+    resampled['timestamp'] = resampled.index.astype('int64') // 10**6
+    
+    # Reorder columns
+    cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    resampled = resampled[cols]
+    
+    # Write to buffer
+    output = io.StringIO()
+    resampled.to_csv(output, index=False)
+    output.seek(0)
+    
+    del df
+    del resampled
+    gc.collect()
+    
+    return output
+
 # --- FastAPI Lifecycle ---
 
 @asynccontextmanager
@@ -180,7 +234,48 @@ app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 def index():
     files = sorted(os.listdir(DATA_DIR)) if os.path.exists(DATA_DIR) else []
     links = {f: f"/data/{f}" for f in files if f.endswith('.csv')}
-    return {"status": "active", "files": links}
+    return {
+        "status": "active", 
+        "files": links,
+        "usage": "GET /export?symbol=BTC/USDT&timeframe=1h"
+    }
+
+@app.get("/export")
+def export_data(symbol: str = Query(..., description="e.g. BTC/USDT"), 
+               timeframe: str = Query("1m", description="e.g. 1m, 1h, 1d")):
+    
+    # Normalize symbol
+    sym = symbol.strip().upper()
+    if sym not in SYMBOL_TO_FILE:
+        # Fallback check for "BTCUSDT" or "BTC-USDT"
+        normalized = sym.replace('-', '/').replace('_', '/')
+        if normalized in SYMBOL_TO_FILE:
+            sym = normalized
+        else:
+            return {"error": "Symbol not found", "available": list(SYMBOL_TO_FILE.keys())}
+            
+    filename = SYMBOL_TO_FILE[sym]
+    file_path = get_file_path(filename)
+    
+    if not os.path.exists(file_path):
+        return {"error": f"Data for {sym} not synced yet."}
+        
+    try:
+        if timeframe == '1m':
+            # Serve directly
+            return FileResponse(file_path, media_type='text/csv', filename=f"{sym.replace('/', '')}_{timeframe}.csv")
+        else:
+            # Resample
+            buf = resample_buffer(file_path, timeframe)
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f"attachment; filename={sym.replace('/', '')}_{timeframe}.csv"}
+            )
+    except Exception as e:
+        return {"error": f"Processing error: {str(e)}"}
+    finally:
+        gc.collect()
 
 if __name__ == "__main__":
     import uvicorn
